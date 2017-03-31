@@ -9,7 +9,7 @@ Pod::Spec.new do |s|
   #s.ios.platform = :ios, '6.0'
   # for using GCD queue as Objective-C objects
   s.ios.deployment_target = "6.0"
-  #s.osx.deployment_target = "10.9" #:osx, '10.9'
+  s.osx.deployment_target = "10.9"
   s.source       = { :git => "https://github.com/tungdev1209/MQTTKit.git" }#, :tag => "#{s.version}" }
 
   s.source_files  = 'libmosquitto/*.{h,c}', 'MQTTKit/*.{h,m}'
