@@ -69,7 +69,8 @@
 
 // dispatch queue to run the mosquitto_loop_forever.
 @property (nonatomic, strong) dispatch_queue_t queue;
-@property (nonatomic, strong) dispatch_queue_t connectionQueue;
+@property (nonatomic, strong) dispatch_queue_t subcriptionQueue;
+@property (nonatomic, strong) dispatch_queue_t publishQueue;
 
 @end
 
@@ -82,35 +83,37 @@
 static void on_connect(struct mosquitto *mosq, void *obj, int rc)
 {
     MQTTClient* client = (__bridge MQTTClient*)obj;
-    dispatch_barrier_async(client.connectionQueue, ^{
-        LogDebug(@"[%@] on_connect rc = %d", client.clientID, rc);
-        client.connected = (rc == ConnectionAccepted);
-        if (client.connectionCompletionHandler) {
-            client.connectionCompletionHandler(rc);
-        }
-    });
+    LogDebug(@"[%@] on_connect rc = %d", client.clientID, rc);
+    client.connected = (rc == ConnectionAccepted);
+    if (client.connectionCompletionHandler) {
+        client.connectionCompletionHandler(rc);
+    }
 }
 
 static void on_disconnect(struct mosquitto *mosq, void *obj, int rc)
 {
     MQTTClient* client = (__bridge MQTTClient*)obj;
-    dispatch_barrier_async(client.connectionQueue, ^{
+    dispatch_sync(client.publishQueue, ^{
         LogDebug(@"[%@] on_disconnect rc = %d", client.clientID, rc);
         [client.publishHandlers removeAllObjects];
+    });
+        
+    dispatch_sync(client.subcriptionQueue, ^{
         [client.subscriptionHandlers removeAllObjects];
         [client.unsubscriptionHandlers removeAllObjects];
-        
-        client.connected = NO;
-        if (client.disconnectionHandler) {
-            client.disconnectionHandler(rc);
-        }
     });
+    
+    client.connected = NO;
+    if (client.disconnectionHandler) {
+        client.disconnectionHandler(rc);
+    }
+    
 }
 
 static void on_publish(struct mosquitto *mosq, void *obj, int message_id)
 {
     MQTTClient* client = (__bridge MQTTClient*)obj;
-    dispatch_async(client.connectionQueue, ^{
+    dispatch_sync(client.publishQueue, ^{
         NSNumber *mid = [NSNumber numberWithInt:message_id];
         void (^handler)(int) = [client.publishHandlers objectForKey:mid];
         if (handler) {
@@ -146,31 +149,41 @@ static void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto
 static void on_subscribe(struct mosquitto *mosq, void *obj, int message_id, int qos_count, const int *granted_qos)
 {
     MQTTClient* client = (__bridge MQTTClient*)obj;
-    dispatch_async(client.connectionQueue, ^{
-        NSNumber *mid = [NSNumber numberWithInt:message_id];
-        MQTTSubscriptionCompletionHandler handler = [client.subscriptionHandlers objectForKey:mid];
-        if (handler) {
-            NSMutableArray *grantedQos = [NSMutableArray arrayWithCapacity:qos_count];
-            for (int i = 0; i < qos_count; i++) {
-                [grantedQos addObject:[NSNumber numberWithInt:granted_qos[i]]];
-            }
-            handler(grantedQos);
-            [client.subscriptionHandlers removeObjectForKey:mid];
-        }
+    NSNumber *mid = [NSNumber numberWithInt:message_id];
+    __block MQTTSubscriptionCompletionHandler handler;
+    
+    dispatch_sync(client.subcriptionQueue, ^{
+        handler = [client.subscriptionHandlers objectForKey:mid];
     });
+    
+    if (handler) {
+        NSMutableArray *grantedQos = [NSMutableArray arrayWithCapacity:qos_count];
+        for (int i = 0; i < qos_count; i++) {
+            [grantedQos addObject:[NSNumber numberWithInt:granted_qos[i]]];
+        }
+        handler(grantedQos);
+        dispatch_sync(client.subcriptionQueue, ^{
+            [client.subscriptionHandlers removeObjectForKey:mid];
+        });
+    }
 }
 
 static void on_unsubscribe(struct mosquitto *mosq, void *obj, int message_id)
 {
     MQTTClient* client = (__bridge MQTTClient*)obj;
-    dispatch_async(client.connectionQueue, ^{
-        NSNumber *mid = [NSNumber numberWithInt:message_id];
-        void (^completionHandler)(void) = [client.unsubscriptionHandlers objectForKey:mid];
-        if (completionHandler) {
-            completionHandler();
-            [client.subscriptionHandlers removeObjectForKey:mid];
-        }
+    NSNumber *mid = [NSNumber numberWithInt:message_id];
+    
+    __block void (^completionHandler)();
+    dispatch_sync(client.subcriptionQueue, ^{
+        completionHandler = [client.unsubscriptionHandlers objectForKey:mid];
     });
+    
+    if (completionHandler) {
+        completionHandler();
+        dispatch_sync(client.subcriptionQueue, ^{
+            [client.subscriptionHandlers removeObjectForKey:mid];
+        });
+    }
 }
 
 
@@ -217,7 +230,8 @@ static void on_unsubscribe(struct mosquitto *mosq, void *obj, int message_id)
         mosquitto_unsubscribe_callback_set(mosq, on_unsubscribe);
 
         self.queue = dispatch_queue_create(cstrClientId, NULL);
-        self.connectionQueue = dispatch_queue_create("com.app.mqttkit.handler.connection", DISPATCH_QUEUE_CONCURRENT);
+        self.subcriptionQueue = dispatch_queue_create("com.app.mqttkit.handler.subcription", DISPATCH_QUEUE_SERIAL);
+        self.publishQueue = dispatch_queue_create("com.app.mqttkit.handler.publish", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
@@ -317,7 +331,9 @@ static void on_unsubscribe(struct mosquitto *mosq, void *obj, int message_id)
   completionHandler:(void (^)(int mid))completionHandler {
     const char* cstrTopic = [topic cStringUsingEncoding:NSUTF8StringEncoding];
     if (qos == 0 && completionHandler) {
-        [self.publishHandlers setObject:completionHandler forKey:[NSNumber numberWithInt:0]];
+        dispatch_sync(_publishQueue, ^{
+            [self.publishHandlers setObject:completionHandler forKey:[NSNumber numberWithInt:0]];
+        });
     }
     int mid;
     mosquitto_publish(mosq, &mid, cstrTopic, payload.length, payload.bytes, qos, retain);
@@ -325,7 +341,9 @@ static void on_unsubscribe(struct mosquitto *mosq, void *obj, int message_id)
         if (qos == 0) {
             completionHandler(mid);
         } else {
-            [self.publishHandlers setObject:completionHandler forKey:[NSNumber numberWithInt:mid]];
+            dispatch_sync(_publishQueue, ^{
+                [self.publishHandlers setObject:completionHandler forKey:[NSNumber numberWithInt:mid]];
+            });
         }
     }
 }
@@ -354,7 +372,9 @@ static void on_unsubscribe(struct mosquitto *mosq, void *obj, int message_id)
     int mid;
     mosquitto_subscribe(mosq, &mid, cstrTopic, qos);
     if (completionHandler) {
-        [self.subscriptionHandlers setObject:[completionHandler copy] forKey:[NSNumber numberWithInteger:mid]];
+        dispatch_sync(_subcriptionQueue, ^{
+            [self.subscriptionHandlers setObject:[completionHandler copy] forKey:[NSNumber numberWithInteger:mid]];
+        });
     }
 }
 
@@ -364,8 +384,11 @@ static void on_unsubscribe(struct mosquitto *mosq, void *obj, int message_id)
     int mid;
     mosquitto_unsubscribe(mosq, &mid, cstrTopic);
     if (completionHandler) {
-        [self.unsubscriptionHandlers setObject:[completionHandler copy] forKey:[NSNumber numberWithInteger:mid]];
+        dispatch_sync(_subcriptionQueue, ^{
+            [self.unsubscriptionHandlers setObject:[completionHandler copy] forKey:[NSNumber numberWithInteger:mid]];
+        });
     }
+    
 }
 
 @end
